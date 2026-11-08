@@ -16,6 +16,7 @@
 - 阶段 5 新增 `-IncludeLegacyOpenAI`（Bash 为 `--include-legacy-openai`），可选择纳入旧版 Azure OpenAI 资源（`kind=OpenAI`）。默认不包含。
 - `tests/smoke.ps1`：PowerShell 离线烟雾测试，与 Bash 版覆盖相同场景。
 - `.claude/skills/azure-foundry-automation/`：AI 助手 Skill，附 CSV 指南与排错指南。
+- AI 工具配置：`AGENTS.md`（Codex、Copilot 等读取）、`CLAUDE.md`（Claude Code）、`.github/copilot-instructions.md`（GitHub Copilot）。三者共享同一套安全规则。
 
 ### 测试
 

@@ -353,18 +353,57 @@ az cognitiveservices account project delete --name <账户名> --resource-group 
 | 5 | 账户读取与 `accounts/listKeys/action`（无此权限时 `ApiKey` 列留空，不中断） |
 | 6 | 读取订阅 Quota Tier 的权限 |
 
-## 使用 AI 助手（Agent Skill）
+## 结合 AI 工具使用
 
-仓库内附带一个 Claude Code Skill：`.claude/skills/azure-foundry-automation/`。用 Claude Code 打开本仓库后，助手会自动识别它，帮你：
+AI 助手可以帮你规划配置、生成 CSV、解读结果和排查错误，但真正的 Azure 操作由你在终端执行。下面按工具说明如何接入。所有工具都遵循同一套规则：先预演、不替你输入确认词、不输出密钥。
 
-- 确认订阅类型（EA、CSP 或已有订阅），选择正确的阶段顺序；
-- 生成或检查 `*.local.csv`，必要时调用 `tools\New-PlanCsv.ps1` 批量生成；
-- 先预演，解读结果 CSV，按错误信息给出排查建议；
-- 在你批准后，告诉你该输入的命令。
+| 工具 | 读取的文件 | 怎么用 |
+|---|---|---|
+| Claude Code | `CLAUDE.md`（指向 `AGENTS.md`）、`.claude/skills/azure-foundry-automation/` | 在仓库目录启动 `claude`，直接用自然语言提问，Skill 会自动加载 |
+| Codex | `AGENTS.md` | 在仓库目录启动 Codex，提问即可，它会先读取 `AGENTS.md` 中的命令与规则 |
+| GitHub Copilot（VS Code 代理模式） | `.github/copilot-instructions.md`；本地会话还会读取 `.claude/skills/` 下的 Skill | 打开仓库，在 Copilot Chat 中选择代理模式提问 |
 
-助手**不会替你输入** `YES`、`EA`、`KEY`，也不会在对话中输出 API Key。正式执行前，它会请你确认。
+### Claude Code
 
-Skill 的参考资料在 `references/` 下：`csv-guide.md`（CSV 字段与写法）、`troubleshooting.md`（错误与解决办法）。
+```bash
+cd <你的仓库>
+claude
+```
+
+示例提问：
+
+- "我有 3 个 EA 订阅，要在 eastus2 和 swedencentral 各部署 gpt-4o-mini，帮我生成 CSV 并预演。"
+- "阶段 3 的结果里有 NoQuota，是什么原因？"
+- "帮我导出交付清单，我需要包含 API Key 的版本，但不要把 key 显示在对话里。"
+
+Skill 的参考资料在 `.claude/skills/azure-foundry-automation/references/` 下：`csv-guide.md`（CSV 字段与写法）、`troubleshooting.md`（错误与解决办法）。
+
+### Codex
+
+在仓库目录启动 Codex，它会读取根目录的 `AGENTS.md`，其中包含项目用途、常用命令和安全规则。
+
+示例提问：
+
+- "读取 AGENTS.md，然后帮我修改阶段 4 的扩容逻辑，修改后运行两套离线测试。"
+- "我的订阅是 CSP 管理的，帮我生成从阶段 2 开始的 CSV，不要包含阶段 1。"
+
+### GitHub Copilot（VS Code）
+
+- `.github/copilot-instructions.md` 会作为仓库指令加入 Copilot Chat 的请求。
+- 在 Copilot Chat 中使用代理模式，它可以运行终端命令。运行前请确认命令是预演（`-DryRun`）。
+- 本地会话会读取 `.claude/skills/` 下的 Skill。也可以把 Skill 放在 `.github/skills/`，两者都是 Copilot 支持的位置。
+
+示例提问：
+
+- "用 tests/smoke.ps1 验证我刚修改的 stage 3 逻辑。"
+- "解释 results 里的 WhatIf 与 Succeeded 有什么区别。"
+
+### 使用时的注意事项
+
+- **在测试环境先试。** 把 AI 工具运行在已登录测试租户的终端中，先用预演验证配置。
+- **不要把密钥粘贴到对话。** 交付清单中的 `ApiKey` 只在 `delivery_reports\*_WITH_KEY.csv` 文件中，让 AI 工具只读取文件路径，不要读取内容。
+- **改代码后运行测试。** 两套离线测试都不访问 Azure，适合让 AI 工具反复运行。
+- **确认命令再执行。** 凡是会修改 Azure 的命令，都由你自己决定是否执行。
 
 ## Bash 版本（可选）
 
@@ -404,6 +443,10 @@ bash tests/smoke.sh
 ├── CHANGELOG.md                      # 版本更新记录
 ├── LICENSE                           # MIT
 ├── README.md
+├── AGENTS.md                         # AI 工具共用说明（Codex、Copilot、Claude Code）
+├── CLAUDE.md                         # Claude Code 入口，指向 AGENTS.md 与 Skill
+├── .github/
+│   └── copilot-instructions.md       # GitHub Copilot 仓库指令
 ├── tools/
 │   └── New-PlanCsv.ps1               # 批量生成 CSV
 ├── .claude/
