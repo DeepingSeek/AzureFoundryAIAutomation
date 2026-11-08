@@ -1,0 +1,2 @@
+BillingAccountName,EnrollmentAccountName,SubscriptionName,SubscriptionId,ResourceGroupName,FoundryResourceName,DefaultProjectName,Location,ModelNames,ModelVersion,ModelFormat,DeploymentType,DeploymentCapacityK
+BILLING-ACCOUNT-ID,ENROLLMENT-ACCOUNT-ID,SUBSCRIPTION-DEMO,11111111-2222-3333-4444-555555555555,rg-foundry-demo,demo-foundry-01-eus2-001,proj-demo-prod-eus2,eastus2,gpt-4o;gpt-4o-mini,2026-01-01,OpenAI,GlobalStandard,
