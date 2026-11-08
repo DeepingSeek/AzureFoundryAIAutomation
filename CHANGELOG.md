@@ -1,5 +1,27 @@
 # 更新记录
 
+## [未发布]
+
+### 修复
+
+- 同一配额池的额度记账：同一订阅、区域、模型和 SKU 的多个账户共享配额，部署（含预演）成功后扣减已分配额度，后续行不再沿用旧的剩余额度（Bash 与 PowerShell 版）。
+- PowerShell 版阶段 1 回填 CSV 失败时立即停止本阶段，并在结果中保留新订阅 ID。此前会继续创建下一个订阅，重跑时可能重复创建（Bash 版已是此行为）。
+- Bash 版配额缓存在子 shell 中写入而丢失，缓存从未生效；现改为全局变量返回，每个配额只请求一次。
+- Bash 版在 Windows 上 Python 输出带 `\r`，导致 SKU、订阅 ID 无法匹配；所有 Python 输出统一去掉回车。
+
+### 新增
+
+- 阶段 2 在创建任何资源之前做区域模型预检：区域不支持的模型组合（名称、版本、格式或 SKU）记为 `NotStarted` 并说明原因（Bash 与 PowerShell 版）。模型列表读取失败时同样视为失败。
+- `tools/New-PlanCsv.ps1`：按订阅列表批量生成 CSV，序号自动生成，地区按订阅轮询。
+- 阶段 5 新增 `-IncludeLegacyOpenAI`（Bash 为 `--include-legacy-openai`），可选择纳入旧版 Azure OpenAI 资源（`kind=OpenAI`）。默认不包含。
+- `tests/smoke.ps1`：PowerShell 离线烟雾测试，与 Bash 版覆盖相同场景。
+- `.claude/skills/azure-foundry-automation/`：AI 助手 Skill，附 CSV 指南与排错指南。
+
+### 测试
+
+- `tests/smoke.sh` 扩展到 23 项，`tests/smoke.ps1` 为 17 项，均离线运行。
+- 假 `az` 增加模型列表、配额 usage 和旧版账户接口。
+
 ## [1.1] - 2026-11-08
 
 ### 修复

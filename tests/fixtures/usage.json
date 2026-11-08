@@ -1,0 +1,4 @@
+[
+  { "name": { "value": "OpenAI.GlobalStandard.gpt-4o-mini" }, "limit": 10, "currentValue": 0 },
+  { "name": { "value": "OpenAI.GlobalStandard.gpt-4o" }, "limit": 10, "currentValue": 0 }
+]

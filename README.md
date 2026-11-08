@@ -108,6 +108,8 @@ BillingAccountName,EnrollmentAccountName,SubscriptionName,SubscriptionId,Resourc
 | 复用已登录的 Azure CLI 会话 | 在命令后加 `-SkipLogin`，脚本会校验租户是否一致 |
 | 查看版本 | `.\Azure_Foundry_AI_Automation.ps1 -Version` |
 | 查看帮助 | `.\Azure_Foundry_AI_Automation.ps1 -Help` |
+| 盘点时包含旧版 Azure OpenAI 资源（`kind=OpenAI`） | 阶段 5 加 `-IncludeLegacyOpenAI`，默认不包含 |
+| 批量生成 CSV（多个订阅） | `.\tools\New-PlanCsv.ps1 -SubscriptionName "sub-a,sub-b" -NamePrefix contoso -Location "eastus2,swedencentral" -ModelNames "gpt-4o"`，见 [批量生成 CSV](#批量生成-csv) |
 
 ## 我该运行哪个阶段
 
@@ -190,7 +192,29 @@ DefaultProjectName    proj-<负载>-<环境>-<区域>                   例：pr
 
 `FoundryResourceName` 在 Azure 全局范围内必须唯一。大小写会保留在资源名中，写入自定义子域名时统一转为小写。
 
+## 批量生成 CSV
+
+订阅较多时，手工逐行填写容易出错。`tools\New-PlanCsv.ps1` 按订阅列表生成 CSV：名称按序号生成，地区按订阅顺序轮询。它只写本地文件，不调用 Azure。
+
+```powershell
+.\tools\New-PlanCsv.ps1 -SubscriptionName "sub-a,sub-b,sub-c" `
+    -SubscriptionId "<guid-a>,<guid-b>,<guid-c>" `
+    -NamePrefix "contoso" -StartIndex 1 -Location "eastus2,swedencentral" `
+    -ModelNames "gpt-4o;gpt-4o-mini" -ModelVersion "2026-01-01" `
+    -OutputPath .\contoso.local.csv
+```
+
+- 列表参数用**逗号分隔**（`pwsh -File` 下 `"a","b"` 会被当成一个字符串）。
+- 序号从 `-StartIndex` 开始，资源组、账户、Project 分别为 `<前缀>-rg-<序号>`、`<NamePrefix>-<序号>`、`<ProjectPrefix>-<序号>`。
+- 输出文件已存在时会拒绝覆盖，确认覆盖请加 `-Force`。
+- 生成后仍请先用 `-DryRun` 预演。
+
 ## 阶段说明
+
+### 阶段 2：创建 Foundry 资源
+
+- **创建任何资源之前先做模型预检**：确认该区域同时支持本行 `ModelNames` 中每个模型的名称、版本、格式和 SKU。不支持时该行记为 `NotStarted`，并在 `ErrorMessage` 中列出不支持的组合，不会留下只能部署失败的半成品资源。
+- 读取模型列表失败时同样视为失败，不会误当作"全部支持"。
 
 ### 阶段 1：创建订阅（仅限 EA）
 
@@ -209,6 +233,7 @@ DefaultProjectName    proj-<负载>-<环境>-<区域>                   例：pr
 ### 阶段 3：部署模型与交付清单
 
 - `DeploymentCapacityK` 留空时使用全部剩余配额；填写的数值超过剩余配额时，实际容量自动降到剩余配额。
+- **同一配额池内的额度会被扣减。** 同一订阅、同一区域、同一模型和 SKU 的多个账户共享配额。前面的行部署后，后面的行会看到扣减后的剩余额度。剩余为 0 时记为 `NoQuota`，不会重复申请超出的容量。预演中同样会计入。
 - 配额单位有两种：**TPM**（文本模型，显示为 `10 K TPM`、`3.333 M TPM`）和 **RPM**（按请求计费的模型，如 `gpt-image-*`、`dall-e`、`sora`，显示为 `10 RPM`）。RPM 由模型名关键字识别，遇到未覆盖的新模型请以门户显示为准。
 - 执行完成后生成交付清单，每个项目一行：
 
@@ -230,6 +255,7 @@ API Key 是明文长期凭据，默认不导出。需要交付时，在提示处
 
 1. **仅导出 CSV 计划中的项目**：用于补导出阶段 3 时忘记输入 `KEY` 的情况。
 2. **导出 CSV 订阅列表中所有 Foundry 账户与项目**：只信任 CSV 中明确填写的 `SubscriptionId`，资源组、账户和项目全部自动发现。未启用 Project 的旧版账户按账户级导出，`ProjectName` 留空。
+   - 默认只扫描 `kind=AIServices` 的 Foundry 账户。加上 `-IncludeLegacyOpenAI`（Bash 为 `--include-legacy-openai`）后，同时包含旧版 Azure OpenAI 资源（`kind=OpenAI`），这类资源按账户级导出。
 
 阶段 5 不支持预演模式。
 
@@ -327,6 +353,19 @@ az cognitiveservices account project delete --name <账户名> --resource-group 
 | 5 | 账户读取与 `accounts/listKeys/action`（无此权限时 `ApiKey` 列留空，不中断） |
 | 6 | 读取订阅 Quota Tier 的权限 |
 
+## 使用 AI 助手（Agent Skill）
+
+仓库内附带一个 Claude Code Skill：`.claude/skills/azure-foundry-automation/`。用 Claude Code 打开本仓库后，助手会自动识别它，帮你：
+
+- 确认订阅类型（EA、CSP 或已有订阅），选择正确的阶段顺序；
+- 生成或检查 `*.local.csv`，必要时调用 `tools\New-PlanCsv.ps1` 批量生成；
+- 先预演，解读结果 CSV，按错误信息给出排查建议；
+- 在你批准后，告诉你该输入的命令。
+
+助手**不会替你输入** `YES`、`EA`、`KEY`，也不会在对话中输出 API Key。正式执行前，它会请你确认。
+
+Skill 的参考资料在 `references/` 下：`csv-guide.md`（CSV 字段与写法）、`troubleshooting.md`（错误与解决办法）。
+
 ## Bash 版本（可选）
 
 Bash 版本与 PowerShell 版本功能一致，参数为 `--` 形式，例如：
@@ -340,13 +379,20 @@ bash Azure_Foundry_AI_Automation.sh --tenant-id "<TENANT-ID>" --csv ./Azure_Foun
 
 ## 测试
 
-仓库提供离线烟雾测试，用假的 `az` 验证参数校验和阶段 1 / 2 / 4 的失败处理，不访问 Azure：
+仓库提供离线烟雾测试，使用假的 `az`（`tests/fake_az.sh`）验证关键路径，不访问 Azure。两套测试覆盖相同的场景：
 
-```bash
+```powershell
+# PowerShell 版（主推）：需要 Git for Windows，用于运行假 az
+pwsh -File .\tests\smoke.ps1
+pwsh -File .\tests\smoke.ps1 -BashPath "C:\Program Files\Git\bin\bash.exe"   # Git 不在默认位置时
+
+# Bash 版
 bash tests/smoke.sh
 ```
 
-测试需要 Bash、`jq` 和 Python 3，在 Windows 上通过 Git Bash 运行。PowerShell 版本和成功路径目前没有自动化测试，修改后请先用测试订阅预演。
+覆盖内容：参数校验；阶段 1 的失败信息回传与停止；阶段 2 的资源组失败、区域模型预检；阶段 3 的同一配额池记账、模型列表失败；阶段 4 的部署列表失败；阶段 5 的旧版 OpenAI 开关；批量生成 CSV 的序号与地区轮询。
+
+这些测试不覆盖成功路径（假 `az` 没有状态），因此修改后仍请用测试订阅先做预演。
 
 ## 目录结构
 
@@ -358,8 +404,14 @@ bash tests/smoke.sh
 ├── CHANGELOG.md                      # 版本更新记录
 ├── LICENSE                           # MIT
 ├── README.md
+├── tools/
+│   └── New-PlanCsv.ps1               # 批量生成 CSV
+├── .claude/
+│   └── skills/
+│       └── azure-foundry-automation/ # AI 助手 Skill（SKILL.md + references/）
 └── tests/
-    ├── smoke.sh                      # 离线烟雾测试
+    ├── smoke.ps1                     # PowerShell 离线烟雾测试
+    ├── smoke.sh                      # Bash 离线烟雾测试
     ├── fake_az.sh                    # 测试用假 az
     └── fixtures/                     # 测试用 CSV 与 JSON
 ```

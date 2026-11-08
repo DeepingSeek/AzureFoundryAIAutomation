@@ -40,6 +40,11 @@ done
 # Windows 下 Python 默认按系统代码页输出，Git Bash 按 UTF-8 显示会乱码，统一为 UTF-8。
 export PYTHONIOENCODING=utf-8
 
+# Windows 上 Python 的标准输出会把 \n 转成 \r\n，read 读到的字段末尾就会带上 \r，
+# 导致 SKU、订阅 ID 等值无法匹配。所有 Python 输出统一经过 tr 去掉回车。
+# pipefail 已开启，Python 失败时仍会返回非零。
+py_run() { "$PYTHON_BIN" "$@" | tr -d '\r'; }
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 TENANT_ID=""
 CSV_PATH="$SCRIPT_DIR/Azure_Foundry_AI_Plan.csv"
@@ -48,6 +53,7 @@ STAGE=""
 DRY_RUN=false
 BROWSER_LOGIN=false
 SKIP_LOGIN=false
+INCLUDE_LEGACY_OPENAI=false
 CREATE_DELAY_SECONDS=10
 CREATE_DELAY_EXPLICIT=false
 
@@ -109,6 +115,8 @@ usage() {
   --skip-login       跳过脚本内置的 az login，使用当前终端已有的登录会话（如客户要求预先用服务主体登录）。
                      仅当 --browser-login 也被条件访问策略拦截时才需要考虑这个更复杂的方案。
                      跳过后仍会校验当前会话的租户是否与 --tenant-id 一致，不一致会报错退出。
+  --include-legacy-openai
+                     仅影响阶段 5 的全量盘点：同时包含旧版 Azure OpenAI 资源（kind=OpenAI），按账户级导出。
   --version          显示脚本版本。
   --help             显示本帮助。
 
@@ -132,6 +140,7 @@ while (($#)); do
     --dry-run) DRY_RUN=true; shift ;;
     --browser-login) BROWSER_LOGIN=true; shift ;;
     --skip-login) SKIP_LOGIN=true; shift ;;
+    --include-legacy-openai) INCLUDE_LEGACY_OPENAI=true; shift ;;
     --version) printf 'Azure Foundry AI Automation v%s\n' "$SCRIPT_VERSION"; exit 0 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
@@ -250,7 +259,7 @@ azure_login() {
 }
 
 format_capacity() {
-  "$PYTHON_BIN" - "$1" "${2:-}" <<'PY'
+  py_run - "$1" "${2:-}" <<'PY'
 import re, sys
 value = int(sys.argv[1])
 model = sys.argv[2] if len(sys.argv) > 2 else ''
@@ -306,7 +315,7 @@ EOF
 # 把 CSV 校验并转换为 JSON Lines，后续各阶段统一按行读取。
 load_plan() {
   local phase="$1"
-  "$PYTHON_BIN" - "$CSV_PATH" "$phase" "$EXPECTED_HEADER" <<'PY'
+  py_run - "$CSV_PATH" "$phase" "$EXPECTED_HEADER" <<'PY'
 import csv, json, re, sys, uuid
 
 csv_path, phase, expected = sys.argv[1], sys.argv[2], sys.argv[3].split(',')
@@ -391,7 +400,7 @@ PY
 #   deployment_name=model:version:format:sku
 expand_models() {
   local row_json="$1"
-  "$PYTHON_BIN" - "$row_json" <<'PY'
+  py_run - "$row_json" <<'PY'
 import json, sys, re
 row = json.loads(sys.argv[1])
 
@@ -441,7 +450,7 @@ deployment_type_of() {
 write_result_header() {
   RESULT_FILE="$RESULT_DIR/$1_${RUN_ID}.csv"
   shift
-  "$PYTHON_BIN" - "$RESULT_FILE" "$@" <<'PY'
+  py_run - "$RESULT_FILE" "$@" <<'PY'
 import csv, sys
 with open(sys.argv[1], 'w', encoding='utf-8', newline='') as handle:
     csv.writer(handle).writerow(sys.argv[2:])
@@ -449,7 +458,7 @@ PY
 }
 
 write_result_row() {
-  "$PYTHON_BIN" - "$RESULT_FILE" "$@" <<'PY'
+  py_run - "$RESULT_FILE" "$@" <<'PY'
 import csv, sys
 with open(sys.argv[1], 'a', encoding='utf-8', newline='') as handle:
     csv.writer(handle).writerow(sys.argv[2:])
@@ -457,7 +466,7 @@ PY
 }
 
 update_plan_subscription_id() {
-  "$PYTHON_BIN" - "$CSV_PATH" "$1" "$2" <<'PY'
+  py_run - "$CSV_PATH" "$1" "$2" <<'PY'
 import csv, os, shutil, sys, tempfile
 from datetime import datetime
 
@@ -537,8 +546,10 @@ get_account_location() {
 }
 
 # 同一订阅/区域/模型/SKU 的配额只查询一次，避免重复请求。
+# 结果通过全局变量 QUOTA_LAST 返回，而不是 $(...)：命令替换在子 shell 中运行，缓存写入会丢失。
 QUOTA_CACHE_KEYS=("")
 QUOTA_CACHE_VALUES=("")
+QUOTA_LAST=""
 
 get_quota() {
   local subscription_id="$1" location="$2" model="$3" sku="$4"
@@ -546,7 +557,7 @@ get_quota() {
   local i
   for ((i = 0; i < ${#QUOTA_CACHE_KEYS[@]}; i++)); do
     if [[ "${QUOTA_CACHE_KEYS[$i]}" == "$key" ]]; then
-      printf '%s' "${QUOTA_CACHE_VALUES[$i]}"
+      QUOTA_LAST="${QUOTA_CACHE_VALUES[$i]}"
       return 0
     fi
   done
@@ -570,7 +581,43 @@ get_quota() {
   [[ -z "$value" ]] && value="NOTFOUND"
   QUOTA_CACHE_KEYS+=("$key")
   QUOTA_CACHE_VALUES+=("$value")
-  printf '%s' "$value"
+  QUOTA_LAST="$value"
+}
+
+# 本次运行中已分配（或预演中计划分配）的额度计入缓存，同一配额池内的后续行才能拿到正确的剩余额度。
+record_quota_allocation() {
+  local subscription_id="$1" location="$2" model="$3" sku="$4" amount="$5"
+  local key="${subscription_id}|${location}|${model}|${sku}" i total used
+  ((amount > 0)) || return 0
+  for ((i = 0; i < ${#QUOTA_CACHE_KEYS[@]}; i++)); do
+    if [[ "${QUOTA_CACHE_KEYS[$i]}" == "$key" ]]; then
+      [[ "${QUOTA_CACHE_VALUES[$i]}" == "NOTFOUND" ]] && return 0
+      total=${QUOTA_CACHE_VALUES[$i]%%|*}
+      used=${QUOTA_CACHE_VALUES[$i]##*|}
+      used=${used%.*}
+      QUOTA_CACHE_VALUES[$i]="${total}|$((used + amount))"
+      return 0
+    fi
+  done
+}
+
+# 输出区域不支持的模型组合，每行一个（格式：模型/版本/SKU）；全部支持时无输出。
+# 模型列表读取失败时返回非零，调用方必须把它当作失败处理，而不是当作“全部支持”。
+unsupported_model_specs() {
+  local row_json="$1" location="$2"
+  local catalog dep model version format sku_item found
+  # 行内没有模型（如阶段 2 的 CSV 未填写 ModelNames）时无需请求模型列表。
+  [[ -z "$(expand_models "$row_json")" ]] && return 0
+  catalog=$(az_json cognitiveservices model list -l "$location") || return 1
+  while IFS=$'\t' read -r dep model version format sku_item; do
+    [[ -z "$model" ]] && continue
+    found=$(printf '%s' "$catalog" | jq --arg n "$model" --arg v "$version" --arg f "$format" --arg s "$sku_item" \
+      '[.[]? | select((.model.name // "") == $n
+        and ($v == "" or (.model.version // "") == $v)
+        and (.model.format // "") == $f
+        and any((.model.skus // [])[]; .name == $s))] | length')
+    ((found > 0)) || printf '%s/%s/%s\n' "$model" "$version" "$sku_item"
+  done < <(expand_models "$row_json")
 }
 
 get_existing_deployments() {
@@ -729,7 +776,7 @@ save_delivery_report() {
     return 0
   fi
 
-  "$PYTHON_BIN" - "$rows_tsv" "$report_file" <<'PY'
+  py_run - "$rows_tsv" "$report_file" <<'PY'
 import csv, sys
 
 source, target = sys.argv[1], sys.argv[2]
@@ -849,7 +896,7 @@ stage_create_subscription() {
     fi
 
     local alias_name alias_url body_file error_file
-    alias_name="ea-$("$PYTHON_BIN" -c 'import uuid; print(uuid.uuid4())')"
+    alias_name="ea-$(py_run -c 'import uuid; print(uuid.uuid4())')"
     alias_url="https://management.azure.com/providers/Microsoft.Subscription/aliases/${alias_name}?api-version=2021-10-01"
     body_file="$TEMP_DIR/${alias_name}.json"
     error_file="$TEMP_DIR/${alias_name}.error"
@@ -1032,6 +1079,23 @@ stage_create_foundry() {
       continue
     fi
 
+    # 创建任何资源之前先确认区域支持该行全部模型组合，避免留下只能部署失败的半成品资源。
+    local unsupported_file="$TEMP_DIR/unsupported_stage2.txt"
+    if ! unsupported_model_specs "$row_json" "$location" > "$unsupported_file"; then
+      error_message="读取区域 $location 的模型列表失败，已在创建任何资源前停止。"
+      log_error "$error_message"
+      write_result_row "$sub_name" "$sub_id" "$rg" "$foundry" "$project" "$location" NotStarted NotStarted NotStarted "$error_message"
+      ok=1
+      continue
+    fi
+    if [[ -s "$unsupported_file" ]]; then
+      error_message="区域 '$location' 不支持以下模型组合，已在创建任何资源前停止：$(tr '\n' ' ' < "$unsupported_file")"
+      log_error "$error_message"
+      write_result_row "$sub_name" "$sub_id" "$rg" "$foundry" "$project" "$location" NotStarted NotStarted NotStarted "$error_message"
+      ok=1
+      continue
+    fi
+
     local provider_state=0
     ensure_provider_registered "$sub_id" || provider_state=$?
     if ((provider_state == 1)); then
@@ -1071,9 +1135,9 @@ stage_create_foundry() {
     fi
 
     local encoded_rg encoded_account encoded_project account_url project_url
-    encoded_rg=$("$PYTHON_BIN" -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$rg")
-    encoded_account=$("$PYTHON_BIN" -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$foundry")
-    encoded_project=$("$PYTHON_BIN" -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$project")
+    encoded_rg=$(py_run -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$rg")
+    encoded_account=$(py_run -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$foundry")
+    encoded_project=$(py_run -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$project")
     account_url="https://management.azure.com/subscriptions/${sub_id}/resourceGroups/${encoded_rg}/providers/Microsoft.CognitiveServices/accounts/${encoded_account}?api-version=2025-06-01"
     project_url="${account_url%%\?*}/projects/${encoded_project}?api-version=2025-06-01"
 
@@ -1209,11 +1273,28 @@ stage_deploy_models() {
       continue
     fi
 
+    local unsupported_file="$TEMP_DIR/unsupported_stage3.txt"
+    if ! unsupported_model_specs "$row_json" "$location" > "$unsupported_file"; then
+      error_message="读取区域 $location 的模型列表失败，已跳过该账户。"
+      log_error "$error_message"
+      write_result_row "$sub_name" "$foundry" "" "$sku" 0 Failed "$error_message"
+      ok=1
+      continue
+    fi
+
     local dep_name model version format sku_item
     while IFS=$'\t' read -r dep_name model version format sku_item; do
       [[ -z "$model" ]] && continue
       local actual_sku="${sku_item:-$sku}"
       local target_dep_name="${dep_name:-$model}"
+
+      if grep -Fxq -- "$model/$version/$actual_sku" "$unsupported_file"; then
+        error_message="区域 $location 不支持该模型组合：$model/$version/$actual_sku"
+        log_error "  $error_message"
+        write_result_row "$sub_name" "$foundry" "$target_dep_name" "$actual_sku" 0 Failed "$error_message"
+        ok=1
+        continue
+      fi
 
       # 必须同时匹配部署名、模型名以及 SKU 类型（忽略空格与大小写差异）
       local existing_match=""
@@ -1241,13 +1322,14 @@ stage_deploy_models() {
       fi
 
       local quota total used remaining configured capacity
-      if ! quota=$(get_quota "$(csv_field "$row_json" 'SubscriptionId')" "$location" "$model" "$actual_sku"); then
+      if ! get_quota "$(csv_field "$row_json" 'SubscriptionId')" "$location" "$model" "$actual_sku"; then
         error_message="读取区域 $location 的配额失败，请检查网络、权限或 Azure CLI 登录状态。"
         log_error "  $error_message"
         write_result_row "$sub_name" "$foundry" "$target_dep_name" "$actual_sku" 0 Failed "$error_message"
         ok=1
         continue
       fi
+      quota="$QUOTA_LAST"
       if [[ "$quota" == "NOTFOUND" ]]; then
         error_message="区域 $location 没有 $actual_sku + $model 的配额项，请确认该区域是否提供此模型与 SKU。"
         log_error "  $error_message"
@@ -1279,6 +1361,7 @@ stage_deploy_models() {
         local status='Succeeded'
         [[ "$DRY_RUN" == true ]] && status='WhatIf'
         write_result_row "$sub_name" "$foundry" "$target_dep_name" "$actual_sku" "$capacity" "$status" ""
+        record_quota_allocation "$(csv_field "$row_json" 'SubscriptionId')" "$location" "$model" "$actual_sku" "$capacity"
       else
         log_error "  ${target_dep_name}：部署创建失败。"
         write_result_row "$sub_name" "$foundry" "$target_dep_name" "$actual_sku" "$capacity" Failed "部署创建失败"
@@ -1348,13 +1431,14 @@ stage_scale_up_quota() {
       printf '%s\n' "$targets" | grep -Fxq "$model_name" || continue
 
       local quota total used remaining target increase
-      if ! quota=$(get_quota "$(csv_field "$row_json" 'SubscriptionId')" "$location" "$model_name" "$sku_name"); then
+      if ! get_quota "$(csv_field "$row_json" 'SubscriptionId')" "$location" "$model_name" "$sku_name"; then
         error_message="读取区域 $location 的配额失败，请检查网络、权限或 Azure CLI 登录状态。"
         log_error "  $error_message"
         write_result_row "$sub_name" "$foundry" "$deployment_name" "$capacity" "$capacity" 0 Failed "$error_message"
         ok=1
         continue
       fi
+      quota="$QUOTA_LAST"
       if [[ "$quota" == "NOTFOUND" ]]; then
         log_warn "  ${deployment_name}：未找到配额项，跳过。"
         write_result_row "$sub_name" "$foundry" "$deployment_name" "$capacity" "$capacity" 0 Skipped "未找到配额项"
@@ -1379,6 +1463,7 @@ stage_scale_up_quota() {
         local status='Succeeded'
         [[ "$DRY_RUN" == true ]] && status='WhatIf'
         write_result_row "$sub_name" "$foundry" "$deployment_name" "$capacity" "$target" "$increase" "$status" ""
+        record_quota_allocation "$(csv_field "$row_json" 'SubscriptionId')" "$location" "$model_name" "$sku_name" "$increase"
       else
         log_error "  ${deployment_name}：扩容失败。"
         write_result_row "$sub_name" "$foundry" "$deployment_name" "$capacity" "$target" "$increase" Failed "扩容失败"
@@ -1396,7 +1481,7 @@ stage_scale_up_quota() {
 # 只接受合法 GUID 格式的 SubscriptionId，格式错误或为空的行跳过而不中断整体读取。
 # 输出格式：每行 "ID:<subId>"（有效订阅）或 "WARN:<提示文本>"（需要转给 log_warn）或 "ERR:<错误文本>"。
 get_csv_subscription_ids() {
-  "$PYTHON_BIN" - "$CSV_PATH" <<'PY'
+  py_run - "$CSV_PATH" <<'PY'
 import csv, sys, uuid
 
 csv_path = sys.argv[1]
@@ -1501,7 +1586,8 @@ export_full_scan() {
       continue
     fi
     local foundry_accounts=""
-    foundry_accounts=$(printf '%s' "$accounts_json" | jq -c '.[] | select(.kind == "AIServices")')
+    foundry_accounts=$(printf '%s' "$accounts_json" | jq -c --argjson legacy "$INCLUDE_LEGACY_OPENAI" \
+      '.[] | select(.kind == "AIServices" or ($legacy and .kind == "OpenAI"))')
     if [[ -z "$foundry_accounts" ]]; then
       log_warn "  订阅 '$sub_name' 下没有找到 Foundry（AIServices）账户。"
       continue
@@ -1514,12 +1600,19 @@ export_full_scan() {
       acct_name=$(printf '%s' "$account_json" | jq -r '.name // ""')
       acct_rg=$(printf '%s' "$account_json" | jq -r '.resourceGroup // ""')
       acct_location=$(printf '%s' "$account_json" | jq -r '.location // ""')
+      if [[ "$(printf '%s' "$account_json" | jq -r '.kind // ""')" == "OpenAI" ]]; then
+        # 旧版 Azure OpenAI 资源没有 Foundry Project，直接按账户级导出，不查询项目列表。
+        log_info "  账户 '$acct_name' 为旧版 Azure OpenAI 资源（kind=OpenAI），按账户级导出。"
+        jq -cn --arg subName "$sub_name" --arg subId "$sub_id" --arg rg "$acct_rg" --arg foundry "$acct_name" --arg loc "$acct_location" \
+          '{SubscriptionName:$subName, SubscriptionId:$subId, ResourceGroupName:$rg, FoundryResourceName:$foundry, DefaultProjectName:"", Location:$loc}' >> "$rows_file"
+        continue
+      fi
 
       # 用原始 ARM REST 调用而不是 `az cognitiveservices account project list`，
       # 因为该子命令需要较新版本的 az CLI 才支持，旧版本会报 "misspelled or not recognized"。
       local encoded_rg encoded_account projects_url projects_json
-      encoded_rg=$("$PYTHON_BIN" -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$acct_rg")
-      encoded_account=$("$PYTHON_BIN" -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$acct_name")
+      encoded_rg=$(py_run -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$acct_rg")
+      encoded_account=$(py_run -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$acct_name")
       projects_url="https://management.azure.com/subscriptions/${sub_id}/resourceGroups/${encoded_rg}/providers/Microsoft.CognitiveServices/accounts/${encoded_account}/projects?api-version=2025-06-01"
 
       if ! projects_json=$(az_rest GET "$projects_url" 2>"$TEMP_DIR/scan.err"); then

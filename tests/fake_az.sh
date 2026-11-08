@@ -36,9 +36,26 @@ case "$args" in
     fi
     echo '{}' ;;
   "cognitiveservices account show"*)
-    echo "eastus2" ;;
+    case "$args" in
+      *"--query location"*) echo "eastus2" ;;
+      *)
+        name=$(printf '%s' "$args" | sed -n 's/.*--name \([^ ]*\).*/\1/p')
+        echo "{\"kind\":\"AIServices\",\"location\":\"eastus2\",\"properties\":{\"customSubDomainName\":\"$name\"}}" ;;
+    esac ;;
   "cognitiveservices usage list"*)
-    echo '[]' ;;
+    if should_fail usage; then
+      echo "simulated usage failure" >&2
+      exit 1
+    fi
+    cat "${FAKE_USAGE:-/dev/null}" 2>/dev/null || echo '[]' ;;
+  "cognitiveservices model list"*)
+    if should_fail model-list; then
+      echo "simulated model list failure" >&2
+      exit 1
+    fi
+    cat "${FAKE_MODELS:-/dev/null}" 2>/dev/null || echo '[]' ;;
+  "cognitiveservices account list"*)
+    cat "${FAKE_CS_ACCOUNTS:-/dev/null}" 2>/dev/null || echo '[]' ;;
   "cognitiveservices account deployment list"*)
     if should_fail deployments-list; then
       echo "simulated deployment list failure" >&2

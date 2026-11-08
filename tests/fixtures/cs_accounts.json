@@ -1,0 +1,14 @@
+[
+  {
+    "name": "demo-foundry-01-eus2-001",
+    "kind": "AIServices",
+    "resourceGroup": "rg-foundry-demo",
+    "location": "eastus2"
+  },
+  {
+    "name": "legacy-aoai-01",
+    "kind": "OpenAI",
+    "resourceGroup": "rg-legacy",
+    "location": "eastus"
+  }
+]

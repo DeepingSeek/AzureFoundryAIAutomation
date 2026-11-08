@@ -11,6 +11,9 @@ SCRIPT="$REPO_DIR/Azure_Foundry_AI_Automation.sh"
 FIXTURES="$TESTS_DIR/fixtures"
 TENANT="00000000-0000-0000-0000-000000000000"
 
+# 假 az 的默认模型目录与配额 usage，各用例可按需覆盖。
+export FAKE_MODELS="$FIXTURES/models.json" FAKE_USAGE="$FIXTURES/usage.json"
+
 WORK=$(mktemp -d)
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
@@ -26,9 +29,10 @@ pass() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
 fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; }
 
 # 有超时命令时限制单次运行时长，避免失败的重试循环挂起测试。
+# Windows 上每次调用 Python 启动较慢，单个用例可能需要数十秒，因此上限取 120 秒。
 run_limited() {
   if command -v timeout >/dev/null 2>&1; then
-    timeout 40 "$@"
+    timeout 120 "$@"
   else
     "$@"
   fi
@@ -107,6 +111,45 @@ FAKE_FAIL="deployments-list" FAKE_ACCOUNTS="$FIXTURES/accounts.json" \
   run_stage "$WORK/t_s4_fail" "" --stage ScaleUpQuota --dry-run --csv "$FIXTURES/plan_existing_subscription.csv"
 expect_rc "读取部署列表失败以 1 退出" 1 "$?"
 f=$(result_file "$WORK/t_s4_fail" stage4_quota_scale_up) && expect_contains "读取部署列表失败记录 Failed 行" "$f" "Failed"
+
+echo "== 阶段 2：区域模型预检（创建资源前） =="
+
+# 区域不支持模型时，应在创建任何资源之前停止，记录 NotStarted。
+FAKE_ACCOUNTS="$FIXTURES/accounts.json" \
+  run_stage "$WORK/t_s2_model" "" --stage CreateFoundry --dry-run --csv "$FIXTURES/plan_unsupported_model.csv"
+expect_rc "区域不支持模型时以 1 退出" 1 "$?"
+f=$(result_file "$WORK/t_s2_model" stage2_foundry_provisioning) && expect_contains "区域不支持模型时资源状态为 NotStarted" "$f" ",NotStarted,NotStarted,NotStarted,"
+expect_contains "区域不支持模型时说明原因" "$f" "不支持以下模型组合"
+
+echo "== 阶段 3：同一配额池的额度记账 =="
+
+# 两个账户共享同一订阅、区域与模型配额：第一行用满 10，第二行应看到剩余 0，而不是沿用旧的剩余额度。
+FAKE_ACCOUNTS="$FIXTURES/accounts.json" \
+  run_stage "$WORK/t_s3_quota" "" --stage DeployModels --dry-run --csv "$FIXTURES/plan_shared_quota.csv"
+expect_rc "同一配额池的两行预演正常结束" 0 "$?"
+f=$(result_file "$WORK/t_s3_quota" stage3_model_deployment)
+expect_contains "首个账户按全部剩余额度计划部署" "$f" ",10,WhatIf,"
+expect_contains "同一配额池的后续账户剩余额度为 0" "$f" ",NoQuota,"
+
+echo "== 阶段 3：模型列表读取失败（fail closed） =="
+
+FAKE_FAIL="model-list" FAKE_ACCOUNTS="$FIXTURES/accounts.json" \
+  run_stage "$WORK/t_s3_modelfail" "" --stage DeployModels --dry-run --csv "$FIXTURES/plan_shared_quota.csv"
+expect_rc "模型列表读取失败以 1 退出" 1 "$?"
+f=$(result_file "$WORK/t_s3_modelfail" stage3_model_deployment) && expect_contains "模型列表读取失败记录 Failed 行" "$f" "Failed"
+
+echo "== 阶段 5：旧版 OpenAI 资源（可选，默认不包含） =="
+
+# 开启 --include-legacy-openai 时，旧版资源按账户级导出；未开启时不应出现在清单中。
+FAKE_CS_ACCOUNTS="$FIXTURES/cs_accounts.json" FAKE_ACCOUNTS="$FIXTURES/accounts.json" \
+  run_stage "$WORK/t_s5_legacy" "2\nYES\n\n" --stage ExportCredentials --include-legacy-openai --csv "$FIXTURES/plan_existing_subscription.csv"
+expect_rc "旧版 OpenAI 全量盘点正常结束" 0 "$?"
+f=$(ls "$WORK/t_s5_legacy"/delivery_reports/foundry_endpoints_scan_*.csv 2>/dev/null | head -1)
+expect_contains "开启开关时旧版资源进入清单" "$f" "legacy-aoai-01"
+
+FAKE_CS_ACCOUNTS="$FIXTURES/cs_accounts.json" FAKE_ACCOUNTS="$FIXTURES/accounts.json" \
+  run_stage "$WORK/t_s5_default" "2\nYES\n\n" --stage ExportCredentials --csv "$FIXTURES/plan_existing_subscription.csv"
+if grep -Fq "legacy-aoai-01" "$WORK/t_s5_default/stdout.txt"; then fail "默认不扫描旧版 OpenAI 资源"; else pass "默认不扫描旧版 OpenAI 资源"; fi
 
 echo
 echo "通过 $PASS 项，失败 $FAIL 项。"

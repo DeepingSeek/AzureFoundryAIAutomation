@@ -23,6 +23,8 @@ param(
     [switch]$DryRun,
     [switch]$BrowserLogin,
     [switch]$SkipLogin,
+    # 仅影响 ExportCredentials 的全量盘点：同时包含旧版 Azure OpenAI 资源（kind=OpenAI，按账户级导出）。
+    [switch]$IncludeLegacyOpenAI,
     [switch]$Version,
     [switch]$Help
 )
@@ -102,6 +104,8 @@ if ($Help) {
   -SkipLogin       跳过脚本内置的 az login，使用当前终端已有的登录会话（如客户提供了服务主体并要求预先自行
                    `az login --service-principal` 登录）。仅当 -BrowserLogin 也被条件访问策略拦截时才需要
                    考虑这个更复杂的方案。跳过后仍会校验当前会话的租户是否与 -TenantId 一致，不一致会报错退出。
+  -IncludeLegacyOpenAI
+                   仅影响阶段 5 全量盘点：同时包含旧版 Azure OpenAI 资源（kind=OpenAI），按账户级导出。
   -Help            显示本帮助。
 
 注：Windows PowerShell/pwsh 必须带 .\ 前缀（当前目录不在命令搜索路径中），不能只写文件名。
@@ -510,6 +514,37 @@ function Get-Quota {
     $value
 }
 
+# 本次运行中已分配（或预演中计划分配）的额度要计入缓存，否则同一配额池内的后续行会沿用旧的剩余额度。
+function Add-QuotaAllocation {
+    param([string]$SubscriptionId, [string]$Location, [string]$ModelName, [string]$SkuName, [int]$Amount)
+    if ($Amount -le 0) { return }
+    $cacheKey = "$SubscriptionId|$Location|$ModelName|$SkuName"
+    if ($script:QuotaCache.ContainsKey($cacheKey)) {
+        $entry = $script:QuotaCache[$cacheKey]
+        if ($entry.Found) { $entry.Allocated += $Amount }
+    }
+}
+
+# 返回区域不支持的模型组合（格式：模型/版本/SKU）。模型列表来自 az cognitiveservices model list。
+function Get-UnsupportedModelSpecs {
+    param([object]$Row, [string]$Location)
+    $specs = @(Expand-ModelSpec -Row $Row)
+    if ($specs.Count -eq 0) { return @() }
+
+    $catalog = @(Invoke-AzJson -Arguments @('cognitiveservices', 'model', 'list', '-l', $Location))
+    $unsupported = @()
+    foreach ($spec in $specs) {
+        $match = @($catalog | Where-Object {
+            ([string](Get-Prop $_ 'model.name')) -eq $spec.Name -and
+            ([string](Get-Prop $_ 'model.format')) -eq $spec.Format -and
+            (-not $spec.Version -or ([string](Get-Prop $_ 'model.version')) -eq $spec.Version) -and
+            (@(Get-Prop $_ 'model.skus' @()) | Where-Object { ([string](Get-Prop $_ 'name')) -eq $spec.Sku }).Count -gt 0
+        })
+        if ($match.Count -eq 0) { $unsupported += "$($spec.Name)/$($spec.Version)/$($spec.Sku)" }
+    }
+    @($unsupported)
+}
+
 function Get-ExistingDeployments {
     param([object]$Row)
     $items = @(Invoke-AzJson -Arguments @('cognitiveservices', 'account', 'deployment', 'list', '--resource-group', [string]$Row.ResourceGroupName, '--name', [string]$Row.FoundryResourceName))
@@ -732,8 +767,18 @@ function Invoke-StageCreateSubscription {
             }
             $newId = [string](Get-Prop $response 'properties.subscriptionId')
             if ([string]::IsNullOrWhiteSpace($newId)) { throw '订阅创建成功但未返回 SubscriptionId。' }
-            Update-PlanSubscriptionId -Rows $rows -SubscriptionName ([string]$row.SubscriptionName) -SubscriptionId $newId
             Write-Info "订阅 '$($row.SubscriptionName)' 创建完成，ID=$newId"
+            try {
+                Update-PlanSubscriptionId -Rows $rows -SubscriptionName ([string]$row.SubscriptionName) -SubscriptionId $newId
+            }
+            catch {
+                # 订阅已创建但 CSV 未记录其 ID。继续创建只会让重跑时重复创建订阅，因此立即停止本阶段（与 Bash 版一致）。
+                $writeBackMessage = "订阅已创建（ID=$newId），但回填 CSV 失败：$($_.Exception.Message)。请先手工把该 ID 填入 SubscriptionId 列，再重新运行。"
+                Write-Err $writeBackMessage
+                $results.Add([pscustomobject]@{ SubscriptionName = $row.SubscriptionName; SubscriptionId = $newId; AliasName = $aliasName; Status = 'Failed'; ErrorMessage = '订阅已创建但回填 CSV 失败，请手工填写 SubscriptionId' })
+                $ok = $false
+                break
+            }
             $results.Add([pscustomobject]@{ SubscriptionName = $row.SubscriptionName; SubscriptionId = $newId; AliasName = $aliasName; Status = 'Succeeded'; ErrorMessage = '' })
         }
         catch {
@@ -825,6 +870,12 @@ function Invoke-StageCreateFoundry {
             $locations = @(Invoke-AzJson -Arguments @('account', 'list-locations'))
             if (@($locations | Where-Object { ([string](Get-Prop $_ 'name')).ToLowerInvariant() -eq $location.ToLowerInvariant() }).Count -eq 0) {
                 throw "区域 '$location' 在订阅 $($row.SubscriptionId) 中不可用。"
+            }
+
+            # 创建任何资源之前先确认区域支持该行全部模型组合，避免留下只能部署失败的半成品资源。
+            $unsupportedModels = @(Get-UnsupportedModelSpecs -Row $row -Location $location)
+            if ($unsupportedModels.Count -gt 0) {
+                throw "区域 '$location' 不支持以下模型组合，已在创建任何资源前停止：$($unsupportedModels -join ', ')"
             }
 
             $providerReady = Register-CognitiveServicesProvider -SubscriptionId ([string]$row.SubscriptionId)
@@ -954,6 +1005,7 @@ function Invoke-StageDeployModels {
             Resolve-Subscription -Row $row -Accounts $accounts | Out-Null
             $location = Get-AccountLocation -Row $row
             $existing = @(Get-ExistingDeployments -Row $row)
+            $unsupportedSpecs = @(Get-UnsupportedModelSpecs -Row $row -Location $location)
         }
         catch {
             $message = "$($_.Exception.Message)"
@@ -964,6 +1016,12 @@ function Invoke-StageDeployModels {
         }
 
         foreach ($spec in @(Expand-ModelSpec -Row $row)) {
+            $specKey = "$($spec.Name)/$($spec.Version)/$($spec.Sku)"
+            if ($unsupportedSpecs -contains $specKey) {
+                $results.Add([pscustomobject]@{ SubscriptionName = $row.SubscriptionName; FoundryResourceName = $row.FoundryResourceName; ModelName = $spec.Name; DeploymentName = $spec.DeploymentName; DeploymentType = $spec.Sku; CapacityK = 0; Status = 'Failed'; ErrorMessage = "区域 $location 不支持该模型组合：$specKey" })
+                $ok = $false
+                continue
+            }
             $status = 'Pending'; $errorMessage = ''; $capacityK = 0
             $specSku = [string]$spec.Sku
             $targetDepName = [string]$spec.DeploymentName
@@ -998,6 +1056,7 @@ function Invoke-StageDeployModels {
                     else {
                         Set-Deployment -Row $row -DeploymentName $targetDepName -ModelName $targetModel -ModelVersion $spec.Version -ModelFormat $spec.Format -SkuName $specSku -CapacityK $capacityK
                         $status = if ($DryRun) { 'WhatIf' } else { 'Succeeded' }
+                        Add-QuotaAllocation -SubscriptionId ([string]$row.SubscriptionId) -Location $location -ModelName $targetModel -SkuName $specSku -Amount $capacityK
                     }
                 }
             }
@@ -1065,6 +1124,7 @@ function Invoke-StageScaleUpQuota {
                 else {
                     Set-Deployment -Row $row -DeploymentName $deployment.DeploymentName -ModelName $deployment.ModelName -ModelVersion $deployment.ModelVersion -ModelFormat $deployment.ModelFormat -SkuName $deployment.SkuName -CapacityK $target
                     $status = if ($DryRun) { 'WhatIf' } else { 'Succeeded' }
+                    Add-QuotaAllocation -SubscriptionId ([string]$row.SubscriptionId) -Location $location -ModelName $deployment.ModelName -SkuName $deployment.SkuName -Amount $increase
                 }
             }
             catch {
@@ -1148,7 +1208,10 @@ function Invoke-ExportFullScan {
         Write-Info "扫描订阅 '$subName'（$subId）"
         $foundryAccounts = $null
         try {
-            $foundryAccounts = @(Invoke-AzJson -Arguments @('cognitiveservices', 'account', 'list', '--subscription', $subId)) | Where-Object { ([string](Get-Prop $_ 'kind')) -eq 'AIServices' }
+            $foundryAccounts = @(Invoke-AzJson -Arguments @('cognitiveservices', 'account', 'list', '--subscription', $subId)) | Where-Object {
+                $kind = [string](Get-Prop $_ 'kind')
+                $kind -eq 'AIServices' -or ($IncludeLegacyOpenAI -and $kind -eq 'OpenAI')
+            }
         }
         catch {
             Write-Warn "  扫描订阅 '$subName' 失败：$($_.Exception.Message)"
@@ -1160,6 +1223,19 @@ function Invoke-ExportFullScan {
             $acctName = [string](Get-Prop $account 'name')
             $acctRg = [string](Get-Prop $account 'resourceGroup')
             $acctLocation = [string](Get-Prop $account 'location')
+            if (([string](Get-Prop $account 'kind')) -eq 'OpenAI') {
+                # 旧版 Azure OpenAI 资源没有 Foundry Project，直接按账户级导出，不查询项目列表。
+                Write-Info "  账户 '$acctName' 为旧版 Azure OpenAI 资源（kind=OpenAI），按账户级导出。"
+                $syntheticRows.Add([pscustomobject]@{
+                        SubscriptionName    = $subName
+                        SubscriptionId      = $subId
+                        ResourceGroupName   = $acctRg
+                        FoundryResourceName = $acctName
+                        DefaultProjectName  = ''
+                        Location            = $acctLocation
+                    })
+                continue
+            }
             # 用原始 ARM REST 调用而不是 `az cognitiveservices account project list`，
             # 因为该子命令需要较新版本的 az CLI 才支持，旧版本会报 "misspelled or not recognized"。
             $encodedRg = [uri]::EscapeDataString($acctRg)
