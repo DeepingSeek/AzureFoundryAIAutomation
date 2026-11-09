@@ -18,6 +18,7 @@ description: 用本仓库的 Azure_Foundry_AI_Automation.ps1 开通和管理 Azu
 信息不全时先问清楚，不要猜测订阅名、账户名或模型版本。
 
 ## 硬性规则（任何情况下都要遵守）
+- **CSP 客户必须加 `-AgreementType CSP`**。脚本会在登录前拒绝阶段 1 与 `All`。
 
 - **不替用户输入确认词**。`YES`、`EA`、`KEY` 以及阶段 5 的菜单选项必须由用户自己在终端输入。你可以告诉用户"此时终端会要求输入 YES，请你确认后输入"。
 - **先预演，再正式执行**。每个会改动 Azure 的阶段都先加 `-DryRun`，把结果给用户看，等用户明确说"可以正式执行"后再去掉 `-DryRun`。
@@ -43,7 +44,9 @@ description: 用本仓库的 Azure_Foundry_AI_Automation.ps1 开通和管理 Azu
 
 ### 第 2 步：按顺序预演
 
-按用户场景选择阶段（见下表），逐个预演：
+先运行只读预检 `-Stage Preflight`（不修改 Azure）。把 FAIL 项先解决；WARN 项告诉用户。配额不足的行会写入 `quota_request_*.csv`，可用于向合作伙伴申请配额。
+
+然后按用户场景选择阶段（见下表），逐个预演：
 
 ```powershell
 .\Azure_Foundry_AI_Automation.ps1 -TenantId "<TENANT-ID>" -Csv .\contoso.local.csv -Stage CreateFoundry -DryRun
@@ -67,7 +70,8 @@ description: 用本仓库的 Azure_Foundry_AI_Automation.ps1 开通和管理 Azu
 | 用户情况 | 运行顺序 |
 |---|---|
 | EA，需要新建订阅 | 阶段 1 `CreateSubscription` → 阶段 2 `CreateFoundry` → 阶段 3 `DeployModels`（或菜单 7） |
-| 订阅已存在（含 CSP） | 阶段 2 `CreateFoundry` → 阶段 3 `DeployModels` |
+| CSP（订阅由合作伙伴创建） | 加 `-AgreementType CSP`；阶段 2 `CreateFoundry` → 阶段 3 `DeployModels`，**不要运行阶段 1 或 `All`** |
+| 订阅已存在 | 阶段 2 `CreateFoundry` → 阶段 3 `DeployModels` |
 | 已部署过，想用满剩余配额 | 阶段 4 `ScaleUpQuota` |
 | 忘了导出 Key，或要盘点所有账户 | 阶段 5 `ExportCredentials` |
 | 查订阅的 Quota Tier | 阶段 6 `QueryQuotaTier` |
@@ -99,6 +103,8 @@ description: 用本仓库的 Azure_Foundry_AI_Automation.ps1 开通和管理 Azu
 | `-SkipLogin` | 复用已登录的 Azure CLI 会话（会校验租户） |
 | `-OutputRoot <路径>` | 日志、结果、交付清单的输出目录 |
 | `-IncludeLegacyOpenAI` | 仅阶段 5 盘点时加入旧版 `kind=OpenAI` 资源 |
+| `-AgreementType` | `EA`（默认）或 `CSP`。CSP 时拒绝阶段 1 与 `All` |
+| `-Stage Preflight` | 只读预检，输出 `stage0_preflight` 与 `quota_request` |
 
 ## 更多参考
 

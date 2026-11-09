@@ -138,6 +138,25 @@ FAKE_FAIL="model-list" FAKE_ACCOUNTS="$FIXTURES/accounts.json" \
 expect_rc "模型列表读取失败以 1 退出" 1 "$?"
 f=$(result_file "$WORK/t_s3_modelfail" stage3_model_deployment) && expect_contains "模型列表读取失败记录 Failed 行" "$f" "Failed"
 
+echo "== CSP 协议：拒绝阶段 1 与 All =="
+
+run_stage "$WORK/t_csp" "" --stage CreateSubscription --agreement-type CSP --csv "$FIXTURES/plan_new_subscriptions.csv"
+expect_rc "CSP 运行阶段 1 时以 1 退出" 1 "$?"
+expect_contains "CSP 运行阶段 1 时给出拒绝原因" "$WORK/t_csp/stdout.txt" "CSP 客户的订阅由合作伙伴创建"
+
+echo "== 预检（只读） =="
+
+FAKE_ACCOUNTS="$FIXTURES/accounts.json" \
+  run_stage "$WORK/t_pf_quota" "" --stage Preflight --csv "$FIXTURES/plan_shared_quota.csv"
+expect_rc "预检存在配额 WARN 但无 FAIL 时以 0 退出" 0 "$?"
+f=$(result_file "$WORK/t_pf_quota" stage0_preflight) && expect_contains "预检记录配额 WARN" "$f" ",Quota,WARN,"
+f=$(result_file "$WORK/t_pf_quota" quota_request) && expect_contains "配额不足的行写入 quota_request" "$f" "gpt-4o-mini"
+
+FAKE_ACCOUNTS="$FIXTURES/accounts.json" \
+  run_stage "$WORK/t_pf_model" "" --stage Preflight --csv "$FIXTURES/plan_unsupported_model.csv"
+expect_rc "预检存在模型 FAIL 时以 1 退出" 1 "$?"
+f=$(result_file "$WORK/t_pf_model" stage0_preflight) && expect_contains "预检标出不支持的模型组合" "$f" ",Model,FAIL,"
+
 echo "== 阶段 5：旧版 OpenAI 资源（可选，默认不包含） =="
 
 # 开启 --include-legacy-openai 时，旧版资源按账户级导出；未开启时不应出现在清单中。

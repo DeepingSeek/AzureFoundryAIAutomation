@@ -15,8 +15,11 @@
 [CmdletBinding()]
 param(
     [string]$TenantId,
-    [ValidateSet('CreateSubscription', 'CreateFoundry', 'DeployModels', 'ScaleUpQuota', 'ExportCredentials', 'QueryQuotaTier', 'All')]
+    [ValidateSet('CreateSubscription', 'CreateFoundry', 'DeployModels', 'ScaleUpQuota', 'ExportCredentials', 'QueryQuotaTier', 'All', 'Preflight')]
     [string]$Stage,
+    # 客户的协议类型。CSP 客户的订阅由合作伙伴创建，脚本会拒绝运行阶段 1 与 All。
+    [ValidateSet('EA', 'CSP')]
+    [string]$AgreementType = 'EA',
     [string]$Csv = (Join-Path $PSScriptRoot 'Azure_Foundry_AI_Plan.csv'),
     [string]$OutputRoot = $PSScriptRoot,
     [int]$CreateDelaySeconds = 10,
@@ -106,6 +109,9 @@ if ($Help) {
                    考虑这个更复杂的方案。跳过后仍会校验当前会话的租户是否与 -TenantId 一致，不一致会报错退出。
   -IncludeLegacyOpenAI
                    仅影响阶段 5 全量盘点：同时包含旧版 Azure OpenAI 资源（kind=OpenAI），按账户级导出。
+  -AgreementType EA|CSP
+                   客户协议类型，默认 EA。CSP 客户的订阅由合作伙伴创建，此时拒绝运行阶段 1（CreateSubscription）与 All。
+  -Stage Preflight 只读预检：检查订阅、区域、Provider、模型、已有部署和配额，输出检查表；配额不足的行写入 quota_request 文件。
   -Help            显示本帮助。
 
 注：Windows PowerShell/pwsh 必须带 .\ 前缀（当前目录不在命令搜索路径中），不能只写文件名。
@@ -1384,6 +1390,169 @@ function Invoke-StageQueryQuotaTier {
 
 # ==================== 交互菜单与入口 ====================
 
+# ==================== 预检（只读） ====================
+
+# 只读检查：不创建、不修改 Azure 资源（仅切换本地 Azure CLI 的当前订阅上下文）。
+# 逐行检查订阅、区域、Provider、模型、已有部署和配额，并按阶段 3 的规则模拟配额分配，
+# 使多个账户共享的配额池能被正确计算。配额不足的行写入 quota_request 文件，可直接用于向合作伙伴申请配额。
+function Invoke-StagePreflight {
+    Write-Info '========== 预检（只读，不修改 Azure 资源） =========='
+    $rows = @(Import-Plan -Phase 'DeployModels')
+    $accounts = @(Invoke-AzJson -Arguments @('account', 'list', '--all'))
+    $checks = New-Object System.Collections.Generic.List[object]
+    $quotaRequests = New-Object System.Collections.Generic.List[object]
+    $ok = $true
+
+    function Add-PreflightCheck {
+        param([object]$Row, [string]$Location, [string]$Check, [string]$Status, [string]$Detail)
+        $checks.Add([pscustomobject]@{ SubscriptionName = $Row.SubscriptionName; SubscriptionId = $Row.SubscriptionId; Location = $Location; Check = $Check; Status = $Status; Detail = $Detail })
+    }
+
+    foreach ($row in $rows) {
+        $location = [string]$row.Location
+        try {
+            $subscription = Resolve-Subscription -Row $row -Accounts $accounts
+            if ([string](Get-Prop $subscription 'state') -ne 'Enabled') { throw "订阅状态为 $(Get-Prop $subscription 'state')，不是 Enabled。" }
+            Add-PreflightCheck -Row $row -Location $location -Check 'Subscription' -Status 'OK' -Detail '订阅可见、名称与租户一致、已启用'
+        }
+        catch {
+            $ok = $false
+            Add-PreflightCheck -Row $row -Location $location -Check 'Subscription' -Status 'FAIL' -Detail $_.Exception.Message
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($location)) {
+            try { $location = Get-AccountLocation -Row $row } catch { $location = '' }
+        }
+        if ([string]::IsNullOrWhiteSpace($location)) {
+            $ok = $false
+            Add-PreflightCheck -Row $row -Location '' -Check 'Location' -Status 'FAIL' -Detail 'CSV 未填写 Location，且 Foundry 账户不存在，无法确定区域'
+            continue
+        }
+
+        try {
+            $locations = @(Invoke-AzJson -Arguments @('account', 'list-locations'))
+            if (@($locations | Where-Object { ([string](Get-Prop $_ 'name')).ToLowerInvariant() -eq $location.ToLowerInvariant() }).Count -eq 0) {
+                $ok = $false
+                Add-PreflightCheck -Row $row -Location $location -Check 'Location' -Status 'FAIL' -Detail "区域 '$location' 在该订阅中不可用"
+                continue
+            }
+            Add-PreflightCheck -Row $row -Location $location -Check 'Location' -Status 'OK' -Detail '区域可用'
+        }
+        catch {
+            $ok = $false
+            Add-PreflightCheck -Row $row -Location $location -Check 'Location' -Status 'FAIL' -Detail "读取区域列表失败：$($_.Exception.Message)"
+            continue
+        }
+
+        $providerState = [string](Get-Prop (Invoke-AzJson -Arguments @('provider', 'show', '--namespace', 'Microsoft.CognitiveServices')) 'registrationState')
+        if ($providerState -eq 'Registered') {
+            Add-PreflightCheck -Row $row -Location $location -Check 'Provider' -Status 'OK' -Detail 'Microsoft.CognitiveServices 已注册'
+        }
+        else {
+            # 未注册不一定失败：阶段 2 会尝试注册。但需要相应权限，合作伙伴账号常见此问题。
+            Add-PreflightCheck -Row $row -Location $location -Check 'Provider' -Status 'WARN' -Detail "状态为 $providerState；阶段 2 会尝试注册，需要注册 Provider 的权限"
+        }
+
+        $specs = @(Expand-ModelSpec -Row $row)
+        $unsupported = @(Get-UnsupportedModelSpecs -Row $row -Location $location)
+        foreach ($item in $unsupported) {
+            $ok = $false
+            Add-PreflightCheck -Row $row -Location $location -Check 'Model' -Status 'FAIL' -Detail "区域不支持：$item"
+        }
+        if ($specs.Count -gt 0 -and $unsupported.Count -eq 0) {
+            Add-PreflightCheck -Row $row -Location $location -Check 'Model' -Status 'OK' -Detail "全部 $($specs.Count) 个模型组合可用"
+        }
+
+        try {
+            $existing = @(Get-ExistingDeployments -Row $row)
+        }
+        catch {
+            $ok = $false
+            Add-PreflightCheck -Row $row -Location $location -Check 'Deployment' -Status 'FAIL' -Detail "读取已有部署失败：$($_.Exception.Message)"
+            continue
+        }
+
+        $configuredText = [string]$row.DeploymentCapacityK
+        $configured = 0
+        $hasConfigured = [int]::TryParse($configuredText, [ref]$configured) -and $configured -gt 0
+
+        foreach ($spec in $specs) {
+            $specKey = "$($spec.Name)/$($spec.Version)/$($spec.Sku)"
+            if ($unsupported -contains $specKey) { continue }
+
+            $alreadyDeployed = @($existing | Where-Object {
+                    $_.DeploymentName -eq $spec.DeploymentName -and $_.ModelName -eq $spec.Name -and
+                    ($_.SkuName -replace ' ', '') -eq ($spec.Sku -replace ' ', '')
+                }).Count -gt 0
+            if ($alreadyDeployed) {
+                Add-PreflightCheck -Row $row -Location $location -Check 'Deployment' -Status 'OK' -Detail "$($spec.DeploymentName)：已存在，阶段 3 会跳过"
+                continue
+            }
+
+            try {
+                $quota = Get-Quota -SubscriptionId ([string]$row.SubscriptionId) -Location $location -ModelName $spec.Name -SkuName $spec.Sku
+            }
+            catch {
+                $ok = $false
+                Add-PreflightCheck -Row $row -Location $location -Check 'Quota' -Status 'FAIL' -Detail "读取配额失败：$($_.Exception.Message)"
+                continue
+            }
+            if (-not $quota.Found) {
+                $ok = $false
+                Add-PreflightCheck -Row $row -Location $location -Check 'Quota' -Status 'FAIL' -Detail "没有 $($spec.Sku) + $($spec.Name) 的配额项"
+                continue
+            }
+
+            $unit = if (Test-IsRpmModel -ModelName $spec.Name) { 'RPM' } else { 'K TPM' }
+            $remaining = [math]::Max(0, $quota.Total - $quota.Allocated)
+            # 与阶段 3 相同的容量规则：配置了正整数时取较小值，否则用满剩余配额。
+            $capacity = if ($hasConfigured) { [math]::Min($configured, $remaining) } else { $remaining }
+            $requested = if ($hasConfigured) { $configured } else { $null }
+
+            if ($capacity -le 0) {
+                $status = 'WARN'
+                $detail = "剩余配额为 0（$unit），阶段 3 将跳过此部署"
+            }
+            elseif ($null -ne $requested -and $requested -gt $capacity) {
+                $status = 'WARN'
+                $detail = "请求 $requested $unit，本次只能部署 $capacity，缺口 $($requested - $capacity)"
+            }
+            else {
+                $status = 'OK'
+                $detail = "可部署 $capacity $unit"
+            }
+            Add-PreflightCheck -Row $row -Location $location -Check 'Quota' -Status $status -Detail $detail
+
+            if ($status -ne 'OK') {
+                $note = if ($capacity -le 0 -and $remaining -le 0 -and $quota.Allocated -gt 0) { '共享配额已被占用（可能包含同订阅/区域的其他账户）' } elseif ($capacity -le 0) { '需要申请配额' } else { '配额不足，需要申请增加' }
+                $quotaRequests.Add([pscustomobject]@{
+                        SubscriptionName = $row.SubscriptionName; SubscriptionId = $row.SubscriptionId; Location = $location
+                        ModelName = $spec.Name; DeploymentType = $spec.Sku; Unit = $unit
+                        TotalAmount = $quota.Total; AllocatedAmount = $quota.Allocated; RemainingAmount = $remaining
+                        RequestedAmount = if ($null -ne $requested) { $requested } else { '' }
+                        GrantableAmount = $capacity
+                        ShortfallAmount = if ($null -ne $requested) { $requested - $capacity } else { '' }
+                        Note = $note
+                    })
+            }
+
+            # 模拟阶段 3 的分配，使同一配额池内后续行看到准确的剩余额度。
+            Add-QuotaAllocation -SubscriptionId ([string]$row.SubscriptionId) -Location $location -ModelName $spec.Name -SkuName $spec.Sku -Amount $capacity
+        }
+    }
+
+    Save-ResultCsv -Name 'stage0_preflight' -Rows $checks.ToArray()
+    $checks.ToArray() | Format-Table -AutoSize | Out-String | Write-Host
+    if ($quotaRequests.Count -gt 0) {
+        Save-ResultCsv -Name 'quota_request' -Rows $quotaRequests.ToArray()
+        Write-Warn "有 $($quotaRequests.Count) 项配额不足或为 0，见 quota_request 文件，可用于向合作伙伴申请配额。"
+    }
+    if ($ok) { Write-Info '预检通过（WARN 项请按提示确认后再执行正式阶段）。' }
+    else { Write-Err '预检发现 FAIL 项，请修复后再执行正式阶段。' }
+    $ok
+}
+
 function Show-Menu {
     Write-Host ''
     Write-Host '========== Azure Foundry 全生命周期工具 =========='
@@ -1394,6 +1563,7 @@ function Show-Menu {
     Write-Host '  5) 导出 Foundry Endpoint 与 API Key（补导出 / 全量盘点）'
     Write-Host '  6) 查询 Azure OpenAI Quota Tier'
     Write-Host '  7) 全流程（1 -> 2 -> 3）'
+    Write-Host '  8) 预检（只读，检查订阅、区域、模型、配额，并生成配额申请清单）'
     Write-Host '  0) 退出'
     Write-Host ''
     $choice = Read-Host '请选择要执行的阶段'
@@ -1405,6 +1575,7 @@ function Show-Menu {
         '5' { 'ExportCredentials' }
         '6' { 'QueryQuotaTier' }
         '7' { 'All' }
+        '8' { 'Preflight' }
         '0' { '' }
         default { throw "无效选项：$choice" }
     }
@@ -1420,7 +1591,13 @@ try {
     $selected = if ([string]::IsNullOrWhiteSpace($Stage)) { Show-Menu } else { $Stage }
     if ([string]::IsNullOrWhiteSpace($selected)) { Write-Info '已退出。'; exit 0 }
 
+    # CSP 客户的订阅由合作伙伴创建。在登录和任何 Azure 调用之前拒绝阶段 1，避免误操作。
+    if ($AgreementType -eq 'CSP' -and $selected -in @('CreateSubscription', 'All')) {
+        throw 'CSP 客户的订阅由合作伙伴创建，不能运行阶段 1（CreateSubscription）或 All。请由合作伙伴创建订阅，把 SubscriptionId 填入 CSV 后运行 CreateFoundry 等阶段。'
+    }
+
     Write-Info "租户：$TenantId"
+    Write-Info "协议类型：$AgreementType"
     Write-Info "规划 CSV：$Csv"
     Write-Info "执行阶段：$selected"
     $modeText = if ($DryRun) { '预演模式（DryRun）' } else { '正式模式（Live）' }
@@ -1444,6 +1621,7 @@ try {
         'ScaleUpQuota' { Invoke-StageScaleUpQuota }
         'ExportCredentials' { Invoke-StageExportCredentials }
         'QueryQuotaTier' { Invoke-StageQueryQuotaTier }
+        'Preflight' { Invoke-StagePreflight }
         'All' {
             $r1 = Invoke-StageCreateSubscription
             $r2 = Invoke-StageCreateFoundry

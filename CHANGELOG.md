@@ -14,13 +14,15 @@
 - 阶段 2 在创建任何资源之前做区域模型预检：区域不支持的模型组合（名称、版本、格式或 SKU）记为 `NotStarted` 并说明原因（Bash 与 PowerShell 版）。模型列表读取失败时同样视为失败。
 - `tools/New-PlanCsv.ps1`：按订阅列表批量生成 CSV，序号自动生成，地区按订阅轮询。
 - 阶段 5 新增 `-IncludeLegacyOpenAI`（Bash 为 `--include-legacy-openai`），可选择纳入旧版 Azure OpenAI 资源（`kind=OpenAI`）。默认不包含。
+- `-AgreementType EA|CSP`（Bash 为 `--agreement-type`，默认 EA）：CSP 客户运行阶段 1 或 `All` 时，在登录前拒绝执行（两版一致）。
+- 新增只读预检阶段 `Preflight`（PowerShell 菜单 8，Bash 菜单 8）：检查订阅可见性与状态、区域、Provider 注册、模型组合、已有部署与配额，并按阶段 3 的规则模拟配额分配。输出 `stage0_preflight`；配额不足的行写入 `quota_request`，列出所需容量、剩余容量、缺口与原因。
 - `tests/smoke.ps1`：PowerShell 离线烟雾测试，与 Bash 版覆盖相同场景。
 - `.claude/skills/azure-foundry-automation/`：AI 助手 Skill，附 CSV 指南与排错指南。
 - AI 工具配置：`AGENTS.md`（Codex、Copilot 等读取）、`CLAUDE.md`（Claude Code）、`.github/copilot-instructions.md`（GitHub Copilot）。三者共享同一套安全规则。
 
 ### 测试
 
-- `tests/smoke.sh` 扩展到 23 项，`tests/smoke.ps1` 为 17 项，均离线运行。
+- `tests/smoke.sh` 扩展到 30 项，`tests/smoke.ps1` 为 26 项，均离线运行。
 - 假 `az` 增加模型列表、配额 usage 和旧版账户接口。
 
 ## [1.1] - 2026-11-08

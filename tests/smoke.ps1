@@ -115,6 +115,30 @@ try {
     $null = Invoke-MainScript -Out $defaultOut -Arguments @('-TenantId', $tenant, '-Stage', 'ExportCredentials', '-SkipLogin', '-Csv', (Join-Path $fixtures 'plan_existing_subscription.csv')) -StdinLines @('2', 'YES', '')
     Check '默认不扫描旧版 OpenAI 资源' (-not ((Get-Content -LiteralPath (Join-Path $defaultOut 'stdout.txt') -Raw) -match 'legacy-aoai-01'))
 
+    Write-Host '== CSP 协议：拒绝阶段 1 与 All ==' -ForegroundColor Cyan
+    $cspOut = Join-Path $work 'csp'
+    $rc = Invoke-MainScript -Out $cspOut -Arguments @('-TenantId', $tenant, '-Stage', 'CreateSubscription', '-AgreementType', 'CSP', '-SkipLogin', '-Csv', (Join-Path $fixtures 'plan_new_subscriptions.csv'))
+    Check 'CSP 运行阶段 1 时以 1 退出' ($rc -eq 1)
+    Check 'CSP 运行阶段 1 时给出拒绝原因' ((Get-Content -LiteralPath (Join-Path $cspOut 'stdout.txt') -Raw) -match 'CSP 客户的订阅由合作伙伴创建')
+    $rc = Invoke-MainScript -Out (Join-Path $work 'csp-all') -Arguments @('-TenantId', $tenant, '-Stage', 'All', '-AgreementType', 'CSP', '-SkipLogin', '-Csv', (Join-Path $fixtures 'plan_new_subscriptions.csv'))
+    Check 'CSP 运行 All 时以 1 退出' ($rc -eq 1)
+
+    Write-Host '== 预检（只读） ==' -ForegroundColor Cyan
+    $pfOut = Join-Path $work 'preflight-quota'
+    $rc = Invoke-MainScript -Out $pfOut -Arguments @('-TenantId', $tenant, '-Stage', 'Preflight', '-SkipLogin', '-Csv', (Join-Path $fixtures 'plan_shared_quota.csv'))
+    Check '预检存在配额 WARN 但无 FAIL 时以 0 退出' ($rc -eq 0)
+    $pfRows = @(Get-ResultRows -Out $pfOut -Prefix 'stage0_preflight')
+    Check '预检输出包含配额检查结果' (@($pfRows | Where-Object { $_.Check -eq 'Quota' }).Count -eq 2)
+    Check '第二个账户的配额检查为 WARN' (@($pfRows | Where-Object { $_.Check -eq 'Quota' -and $_.Status -eq 'WARN' }).Count -eq 1)
+    $quotaReq = @(Get-ResultRows -Out $pfOut -Prefix 'quota_request')
+    Check '配额不足的行写入 quota_request' ($quotaReq.Count -eq 1 -and $quotaReq[0].ModelName -eq 'gpt-4o-mini')
+
+    $pfModel = Join-Path $work 'preflight-model'
+    $rc = Invoke-MainScript -Out $pfModel -Arguments @('-TenantId', $tenant, '-Stage', 'Preflight', '-SkipLogin', '-Csv', (Join-Path $fixtures 'plan_unsupported_model.csv'))
+    Check '预检存在模型 FAIL 时以 1 退出' ($rc -eq 1)
+    $pfModelRows = @(Get-ResultRows -Out $pfModel -Prefix 'stage0_preflight')
+    Check '预检标出不支持的模型组合' (@($pfModelRows | Where-Object { $_.Check -eq 'Model' -and $_.Status -eq 'FAIL' }).Count -eq 1)
+
     Write-Host '== 阶段 1：回填 CSV 失败时停止（避免重复创建） ==' -ForegroundColor Cyan
     $wbOut = Join-Path $work 'writeback'
     $wbCsv = Join-Path $work 'writeback.local.csv'

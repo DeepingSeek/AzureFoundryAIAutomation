@@ -54,6 +54,7 @@ DRY_RUN=false
 BROWSER_LOGIN=false
 SKIP_LOGIN=false
 INCLUDE_LEGACY_OPENAI=false
+AGREEMENT_TYPE="EA"
 CREATE_DELAY_SECONDS=10
 CREATE_DELAY_EXPLICIT=false
 
@@ -117,6 +118,8 @@ usage() {
                      跳过后仍会校验当前会话的租户是否与 --tenant-id 一致，不一致会报错退出。
   --include-legacy-openai
                      仅影响阶段 5 的全量盘点：同时包含旧版 Azure OpenAI 资源（kind=OpenAI），按账户级导出。
+  --agreement-type EA|CSP
+                     客户协议类型，默认 EA。CSP 客户的订阅由合作伙伴创建，此时拒绝运行阶段 1（CreateSubscription）与 All。
   --version          显示脚本版本。
   --help             显示本帮助。
 
@@ -141,6 +144,7 @@ while (($#)); do
     --browser-login) BROWSER_LOGIN=true; shift ;;
     --skip-login) SKIP_LOGIN=true; shift ;;
     --include-legacy-openai) INCLUDE_LEGACY_OPENAI=true; shift ;;
+    --agreement-type) AGREEMENT_TYPE="${2:-}"; shift 2 ;;
     --version) printf 'Azure Foundry AI Automation v%s\n' "$SCRIPT_VERSION"; exit 0 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
@@ -1763,6 +1767,213 @@ stage_query_quota_tier() {
 
 # ==================== 交互菜单与入口 ====================
 
+# ==================== 预检（只读） ====================
+
+# 记录一条检查结果到临时文件：订阅名、订阅 ID、区域、检查项、状态、说明。
+# 使用 | 作为分隔符：IFS 为制表符时，连续的空字段会被合并，导致列错位。CSV 校验已禁止字段包含 |。
+preflight_add_check() {
+  local row_json="$1" location="$2" check="$3" status="$4" detail="$5"
+  printf '%s|%s|%s|%s|%s|%s\n' "$(csv_field "$row_json" 'SubscriptionName')" "$(csv_field "$row_json" 'SubscriptionId')" \
+    "$location" "$check" "$status" "$(printf '%s' "$detail" | tr '|\n' '  ')" >> "$PREFLIGHT_CHECK_FILE"
+}
+
+# 只读检查：不创建、不修改 Azure 资源（仅切换本地 Azure CLI 的当前订阅上下文）。
+# 规则与 PowerShell 版 Invoke-StagePreflight 一致：配额按阶段 3 的规则模拟分配，配额不足的行写入 quota_request。
+stage_preflight() {
+  log_info '========== 预检（只读，不修改 Azure 资源） =========='
+  local rows_file="$TEMP_DIR/rows_preflight.jsonl"
+  load_plan 'DeployModels' > "$rows_file" || return 1
+  load_account_list || return 1
+
+  PREFLIGHT_CHECK_FILE="$TEMP_DIR/preflight_checks.tsv"
+  local quota_file="$TEMP_DIR/preflight_quota.tsv"
+  : > "$PREFLIGHT_CHECK_FILE"
+  : > "$quota_file"
+  local ok=0
+
+  local row_json
+  while IFS= read -r row_json; do
+    local sub_name sub_id location
+    sub_name=$(csv_field "$row_json" 'SubscriptionName')
+    sub_id=$(csv_field "$row_json" 'SubscriptionId')
+    location=$(csv_field "$row_json" 'Location')
+
+    if ! resolve_subscription "$row_json" > /dev/null 2> "$TEMP_DIR/pf_sub.err"; then
+      ok=1
+      preflight_add_check "$row_json" '' 'Subscription' 'FAIL' "$(tr '\n' ' ' < "$TEMP_DIR/pf_sub.err")"
+      continue
+    fi
+    local sub_state
+    sub_state=$(printf '%s' "$ACCOUNT_LIST_JSON" | jq -r --arg id "$sub_id" \
+      '[.[]? | select((.id // "" | ascii_downcase) == ($id | ascii_downcase))][0].state // ""')
+    if [[ "$sub_state" != "Enabled" ]]; then
+      ok=1
+      preflight_add_check "$row_json" '' 'Subscription' 'FAIL' "订阅状态为 ${sub_state:-未知}，不是 Enabled。"
+      continue
+    fi
+    preflight_add_check "$row_json" '' 'Subscription' 'OK' '订阅可见、名称与租户一致、已启用'
+
+    if [[ -z "$location" ]]; then
+      location=$(get_account_location "$row_json" 2>/dev/null || true)
+    fi
+    if [[ -z "$location" ]]; then
+      ok=1
+      preflight_add_check "$row_json" '' 'Location' 'FAIL' 'CSV 未填写 Location，且 Foundry 账户不存在，无法确定区域'
+      continue
+    fi
+
+    local locations_json location_count
+    if ! locations_json=$(az_json account list-locations 2>/dev/null); then
+      ok=1
+      preflight_add_check "$row_json" "$location" 'Location' 'FAIL' '读取区域列表失败'
+      continue
+    fi
+    location_count=$(printf '%s' "$locations_json" | jq --arg l "$(printf '%s' "$location" | tr '[:upper:]' '[:lower:]')" \
+      '[.[]? | select((.name // "" | ascii_downcase) == $l)] | length')
+    if ((location_count == 0)); then
+      ok=1
+      preflight_add_check "$row_json" "$location" 'Location' 'FAIL' "区域 '$location' 在该订阅中不可用"
+      continue
+    fi
+    preflight_add_check "$row_json" "$location" 'Location' 'OK' '区域可用'
+
+    local provider_state
+    if ! provider_state=$(az_json provider show --namespace Microsoft.CognitiveServices 2>/dev/null | jq -r '.registrationState // ""'); then
+      ok=1
+      preflight_add_check "$row_json" "$location" 'Provider' 'FAIL' '读取 Microsoft.CognitiveServices 注册状态失败'
+    elif [[ "$provider_state" == "Registered" ]]; then
+      preflight_add_check "$row_json" "$location" 'Provider' 'OK' 'Microsoft.CognitiveServices 已注册'
+    else
+      # 未注册不一定失败：阶段 2 会尝试注册。但需要相应权限，合作伙伴账号常见此问题。
+      preflight_add_check "$row_json" "$location" 'Provider' 'WARN' "状态为 ${provider_state}；阶段 2 会尝试注册，需要注册 Provider 的权限"
+    fi
+
+    local spec_count unsupported_file="$TEMP_DIR/pf_unsupported.txt"
+    spec_count=$(expand_models "$row_json" | awk 'NF' | wc -l | tr -d ' ')
+    if ! unsupported_model_specs "$row_json" "$location" > "$unsupported_file"; then
+      ok=1
+      preflight_add_check "$row_json" "$location" 'Model' 'FAIL' '读取区域模型列表失败'
+      continue
+    fi
+    local item
+    while IFS= read -r item; do
+      [[ -z "$item" ]] && continue
+      ok=1
+      preflight_add_check "$row_json" "$location" 'Model' 'FAIL' "区域不支持：$item"
+    done < "$unsupported_file"
+    if ((spec_count > 0)) && [[ ! -s "$unsupported_file" ]]; then
+      preflight_add_check "$row_json" "$location" 'Model' 'OK' "全部 ${spec_count} 个模型组合可用"
+    fi
+
+    local existing_raw=""
+    if ! existing_raw=$(get_existing_deployments "$row_json"); then
+      ok=1
+      preflight_add_check "$row_json" "$location" 'Deployment' 'FAIL' '读取已有部署失败'
+      continue
+    fi
+
+    local configured=""
+    configured=$(csv_field "$row_json" 'DeploymentCapacityK')
+    local has_configured=false
+    [[ "$configured" =~ ^[0-9]+$ ]] && ((configured > 0)) && has_configured=true
+
+    local dep_name model version format sku_item
+    while IFS=$'\t' read -r dep_name model version format sku_item; do
+      [[ -z "$model" ]] && continue
+      local actual_sku="${sku_item:-$(deployment_type_of "$row_json")}"
+      local target_dep_name="${dep_name:-$model}"
+      if grep -Fxq -- "$model/$version/$actual_sku" "$unsupported_file"; then
+        continue
+      fi
+
+      if [[ -n "$existing_raw" ]] && printf '%s\n' "$existing_raw" | awk -F'\t' -v n="$target_dep_name" -v m="$model" -v s="$actual_sku" \
+        'BEGIN { f = 0 } $1 == n && $2 == m && $5 == s { f = 1 } END { exit !f }'; then
+        preflight_add_check "$row_json" "$location" 'Deployment' 'OK' "${target_dep_name}：已存在，阶段 3 会跳过"
+        continue
+      fi
+
+      if ! get_quota "$sub_id" "$location" "$model" "$actual_sku"; then
+        ok=1
+        preflight_add_check "$row_json" "$location" 'Quota' 'FAIL' '读取配额失败'
+        continue
+      fi
+      local quota="$QUOTA_LAST"
+      if [[ "$quota" == "NOTFOUND" ]]; then
+        ok=1
+        preflight_add_check "$row_json" "$location" 'Quota' 'FAIL' "没有 ${actual_sku} + ${model} 的配额项"
+        continue
+      fi
+
+      local total used remaining unit lower_model
+      total=${quota%%|*}
+      used=${quota##*|}
+      total=${total%.*}
+      used=${used%.*}
+      remaining=$((total - used))
+      ((remaining < 0)) && remaining=0
+      lower_model=$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')
+      unit='K TPM'
+      [[ "$lower_model" =~ (gpt-image|dall-e|dalle|sora) ]] && unit='RPM'
+
+      local capacity requested=""
+      if [[ "$has_configured" == true ]]; then
+        requested=$configured
+        ((configured < remaining)) && capacity=$configured || capacity=$remaining
+      else
+        capacity=$remaining
+      fi
+
+      local status detail note=""
+      if ((capacity <= 0)); then
+        status='WARN'
+        detail="剩余配额为 0（${unit}），阶段 3 将跳过此部署"
+        if ((used > 0)); then note='共享配额已被占用（可能包含同订阅/区域的其他账户）'; else note='需要申请配额'; fi
+      elif [[ -n "$requested" ]] && ((requested > capacity)); then
+        status='WARN'
+        detail="请求 ${requested} ${unit}，本次只能部署 ${capacity}，缺口 $((requested - capacity))"
+        note='配额不足，需要申请增加'
+      else
+        status='OK'
+        detail="可部署 ${capacity} ${unit}"
+      fi
+      preflight_add_check "$row_json" "$location" 'Quota' "$status" "$detail"
+
+      if [[ "$status" != "OK" ]]; then
+        local shortfall=""
+        [[ -n "$requested" ]] && shortfall=$((requested - capacity))
+        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$sub_name" "$sub_id" "$location" "$model" "$actual_sku" \
+          "$unit" "$total" "$used" "$remaining" "$requested" "$capacity" "$shortfall" "$note" >> "$quota_file"
+      fi
+
+      # 模拟阶段 3 的分配，使同一配额池内后续行看到准确的剩余额度。
+      record_quota_allocation "$sub_id" "$location" "$model" "$actual_sku" "$capacity"
+    done < <(expand_models "$row_json")
+  done < "$rows_file"
+
+  write_result_header 'stage0_preflight' SubscriptionName SubscriptionId Location Check Status Detail
+  local a b c d e f
+  while IFS='|' read -r a b c d e f; do
+    write_result_row "$a" "$b" "$c" "$d" "$e" "$f"
+  done < "$PREFLIGHT_CHECK_FILE"
+  log_info "结果文件：$RESULT_FILE"
+
+  if [[ -s "$quota_file" ]]; then
+    write_result_header 'quota_request' SubscriptionName SubscriptionId Location ModelName DeploymentType Unit TotalAmount AllocatedAmount RemainingAmount RequestedAmount GrantableAmount ShortfallAmount Note
+    local qa qb qc qd qe qf qg qh qi qj qk ql qm
+    while IFS='|' read -r qa qb qc qd qe qf qg qh qi qj qk ql qm; do
+      write_result_row "$qa" "$qb" "$qc" "$qd" "$qe" "$qf" "$qg" "$qh" "$qi" "$qj" "$qk" "$ql" "$qm"
+    done < "$quota_file"
+    log_warn "有配额不足或为 0 的行，见 quota_request 文件，可用于向合作伙伴申请配额。"
+  fi
+
+  if ((ok == 0)); then
+    log_info '预检通过（WARN 项请按提示确认后再执行正式阶段）。'
+  else
+    log_error '预检发现 FAIL 项，请修复后再执行正式阶段。'
+  fi
+  return "$ok"
+}
+
 show_menu() {
   cat >&2 <<'EOF'
 
@@ -1774,6 +1985,7 @@ show_menu() {
   5) 导出 Foundry Endpoint 与 API Key（补导出 / 全量盘点）
   6) 查询 Azure OpenAI Quota Tier
   7) 全流程（1 -> 2 -> 3）
+  8) 预检（只读，检查订阅、区域、模型、配额，并生成配额申请清单）
   0) 退出
 
 EOF
@@ -1788,6 +2000,7 @@ EOF
     5) printf 'ExportCredentials' ;;
     6) printf 'QueryQuotaTier' ;;
     7) printf 'All' ;;
+    8) printf 'Preflight' ;;
     0) printf '' ;;
     *) echo "无效选项：$choice" >&2; exit 2 ;;
   esac
@@ -1797,7 +2010,18 @@ confirm_environment
 [[ -z "$STAGE" ]] && STAGE=$(show_menu)
 if [[ -z "$STAGE" ]]; then log_info '已退出。'; exit 0; fi
 
+# CSP 客户的订阅由合作伙伴创建。在登录和任何 Azure 调用之前拒绝阶段 1，避免误操作（与 PowerShell 版一致）。
+if [[ "$AGREEMENT_TYPE" != "EA" && "$AGREEMENT_TYPE" != "CSP" ]]; then
+  echo "--agreement-type 只能是 EA 或 CSP。" >&2
+  exit 2
+fi
+if [[ "$AGREEMENT_TYPE" == "CSP" && ( "$STAGE" == "CreateSubscription" || "$STAGE" == "All" ) ]]; then
+  echo "CSP 客户的订阅由合作伙伴创建，不能运行阶段 1（CreateSubscription）或 All。请由合作伙伴创建订阅，把 SubscriptionId 填入 CSV 后运行 CreateFoundry 等阶段。" >&2
+  exit 1
+fi
+
 log_info "租户：$TENANT_ID"
+log_info "协议类型：$AGREEMENT_TYPE"
 log_info "规划 CSV：$CSV_PATH"
 log_info "执行阶段：$STAGE"
 if [[ "$DRY_RUN" == true ]]; then
@@ -1825,6 +2049,7 @@ case "$STAGE" in
   ScaleUpQuota) stage_scale_up_quota || EXIT_CODE=1 ;;
   ExportCredentials) stage_export_credentials || EXIT_CODE=1 ;;
   QueryQuotaTier) stage_query_quota_tier || EXIT_CODE=1 ;;
+  Preflight) stage_preflight || EXIT_CODE=1 ;;
   All)
     stage_create_subscription || EXIT_CODE=1
     stage_create_foundry || EXIT_CODE=1

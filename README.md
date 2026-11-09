@@ -108,6 +108,8 @@ BillingAccountName,EnrollmentAccountName,SubscriptionName,SubscriptionId,Resourc
 | 复用已登录的 Azure CLI 会话 | 在命令后加 `-SkipLogin`，脚本会校验租户是否一致 |
 | 查看版本 | `.\Azure_Foundry_AI_Automation.ps1 -Version` |
 | 查看帮助 | `.\Azure_Foundry_AI_Automation.ps1 -Help` |
+| CSP 客户（订阅由合作伙伴创建） | 加 `-AgreementType CSP`，此时拒绝阶段 1 与 All，见 [CSP 客户](#csp-客户) |
+| 只读预检（不修改 Azure） | `-Stage Preflight`，输出检查表与配额申请清单 |
 | 盘点时包含旧版 Azure OpenAI 资源（`kind=OpenAI`） | 阶段 5 加 `-IncludeLegacyOpenAI`，默认不包含 |
 | 批量生成 CSV（多个订阅） | `.\tools\New-PlanCsv.ps1 -SubscriptionName "sub-a,sub-b" -NamePrefix contoso -Location "eastus2,swedencentral" -ModelNames "gpt-4o"`，见 [批量生成 CSV](#批量生成-csv) |
 
@@ -120,6 +122,8 @@ BillingAccountName,EnrollmentAccountName,SubscriptionName,SubscriptionId,Resourc
 | 已有部署，还有剩余配额想用满 | `-Stage ScaleUpQuota` |
 | 忘记在阶段 3 导出 API Key，或需要盘点所有账户 | `-Stage ExportCredentials` |
 | 查询订阅的 Quota Tier | `-Stage QueryQuotaTier` |
+| CSP 客户，订阅由合作伙伴创建 | `-AgreementType CSP`，从 `-Stage CreateFoundry` 开始，不要运行阶段 1 或 `All` |
+| 正式执行前检查订阅、区域、模型和配额 | `-Stage Preflight`（只读） |
 
 各阶段的完整说明见 [阶段说明](#阶段说明)。
 
@@ -132,6 +136,7 @@ BillingAccountName,EnrollmentAccountName,SubscriptionName,SubscriptionId,Resourc
 | 5 | `ExportCredentials` | 补导出 Endpoint 与 API Key，或按订阅全量盘点 |
 | 6 | `QueryQuotaTier` | 查询订阅级 Azure OpenAI Quota Tier（预览 API） |
 | 7 | `All` | 依次执行阶段 1 → 2 → 3（仅限 EA） |
+| 8 | `Preflight` | 只读预检：订阅、区域、Provider、模型、已有部署和配额；输出检查表与配额申请清单 |
 
 ## CSV 配置
 
@@ -264,6 +269,36 @@ API Key 是明文长期凭据，默认不导出。需要交付时，在提示处
 只读取 CSV 中合法的 `SubscriptionId`，调用 ARM 预览 API `2025-10-01-preview`，输出 `QuotaTier`、`AssignmentDate`、`TierUpgradePolicy`、`Status` 和 `ErrorMessage`。
 
 > 该接口返回的是订阅级 Quota Tier，不是区域或模型的已分配配额。预览 API 的字段可能调整。
+
+## CSP 客户
+
+CSP 客户的订阅由合作伙伴通过 CSP 渠道创建。客户只需要提供租户 ID 和订阅 ID，合作伙伴在 CSV 中填入 `SubscriptionId` 后运行阶段 2 及之后的阶段。
+
+```powershell
+.\Azure_Foundry_AI_Automation.ps1 -TenantId "<TENANT-ID>" -AgreementType CSP -Csv .\Azure_Foundry_AI_Plan.local.csv -Stage Preflight
+```
+
+- `-AgreementType CSP` 会让脚本在**登录之前**拒绝阶段 1（`CreateSubscription`）与 `All`，报错说明原因。菜单中的 1 与 7 也同样被拒绝。
+- 默认为 `EA`，行为与之前一致。
+- 运行顺序建议：`Preflight`（先看 FAIL 与 WARN）→ `CreateFoundry` → `DeployModels`。预检中配额不足的行会写入 `quota_request_*.csv`，合作伙伴可以直接用它提交配额申请。
+- Bash 版使用 `--agreement-type CSP`。
+
+## 预检（Preflight，只读）
+
+`-Stage Preflight` 逐行检查 CSV，不创建或修改任何 Azure 资源（只切换本地 Azure CLI 的当前订阅）。
+
+| 检查项 | 通过条件 | 不通过时 |
+|---|---|---|
+| `Subscription` | 订阅可见、名称与租户一致、状态为 Enabled | `FAIL` |
+| `Location` | 区域在该订阅中可用 | `FAIL` |
+| `Provider` | `Microsoft.CognitiveServices` 已注册 | `WARN`（阶段 2 会尝试注册，需要权限） |
+| `Model` | 区域支持每个模型的名称、版本、格式和 SKU | `FAIL` |
+| `Deployment` | 已存在且类型一致（阶段 3 会跳过） | 仅显示 |
+| `Quota` | 剩余配额足够本行请求 | `WARN`（剩余为 0 或不足） |
+
+- 配额按阶段 3 的规则模拟分配，多个账户共享的配额池会被正确扣减。
+- 有 `FAIL` 时以退出码 1 结束；只有 `WARN` 时以 0 结束，但请先确认 WARN 项。
+- 结果写入 `results\stage0_preflight_*.csv`。配额不足的行另外写入 `results\quota_request_*.csv`，列包括所需容量、剩余容量、缺口与原因。
 
 ## 输出文件
 
@@ -429,7 +464,7 @@ pwsh -File .\tests\smoke.ps1 -BashPath "C:\Program Files\Git\bin\bash.exe"   # G
 bash tests/smoke.sh
 ```
 
-覆盖内容：参数校验；阶段 1 的失败信息回传与停止；阶段 2 的资源组失败、区域模型预检；阶段 3 的同一配额池记账、模型列表失败；阶段 4 的部署列表失败；阶段 5 的旧版 OpenAI 开关；批量生成 CSV 的序号与地区轮询。
+覆盖内容：参数校验；阶段 1 的失败信息回传与停止，以及 CSP 协议拒绝；阶段 2 的资源组失败、区域模型预检；阶段 3 的同一配额池记账、模型列表失败；阶段 4 的部署列表失败；阶段 5 的旧版 OpenAI 开关；预检（只读）的 WARN 与 FAIL 结果及 quota_request 输出；批量生成 CSV 的序号与地区轮询。PowerShell 版另外覆盖阶段 1 回填失败时的停止。
 
 这些测试不覆盖成功路径（假 `az` 没有状态），因此修改后仍请用测试订阅先做预演。
 
